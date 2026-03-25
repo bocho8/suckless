@@ -17,6 +17,14 @@ PATCHES_DIR="patches"                   # name of the subfolder with patch files
 STATUS_FILE=".patches_applied"          # file to record applied patches
 
 # ------------------------------
+# Check required commands
+# ------------------------------
+if ! command -v patch &>/dev/null; then
+    echo -e "\e[31mError: The 'patch' command is not installed. Install it with: sudo pacman -S patch\e[0m" >&2
+    exit 1
+fi
+
+# ------------------------------
 # Utility functions
 # ------------------------------
 error() {
@@ -36,7 +44,7 @@ is_program_dir() {
     [[ -d "$1" && -f "$1/config.def.h" && ( -f "$1/config.h" || -f "$1/config.mk" ) ]]
 }
 
-# Get list of program directories
+# Get list of program directories (one per line)
 get_programs() {
     local dirs=()
     for d in */; do
@@ -45,7 +53,7 @@ get_programs() {
             dirs+=("$d")
         fi
     done
-    echo "${dirs[@]}"
+    printf "%s\n" "${dirs[@]}"
 }
 
 # Show status of a program
@@ -65,12 +73,38 @@ show_status() {
     echo "=========================="
 }
 
+# Ensure clean git state before patching (if repo)
+ensure_clean_git() {
+    local prog="$1"
+    if [[ -d "$prog/.git" ]]; then
+        if [[ -n "$(cd "$prog" && git status --porcelain)" ]]; then
+            warn "You have uncommitted changes in $prog."
+            read -p "Commit them now? (y/n/skip) [y/N] " -n 1 -r
+            echo
+            case "$REPLY" in
+                y|Y)
+                    (cd "$prog" && git add -A && git commit -m "WIP before applying patch")
+                    info "Changes committed."
+                    ;;
+                s|S)
+                    info "Skipping – changes will remain uncommitted."
+                    ;;
+                *)
+                    warn "Aborting patch application. Please commit or stash your changes first."
+                    return 1
+                    ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
 # Apply a patch
 apply_patch() {
     local prog="$1"
     local patchfile="$2"
-    local patch_name
-    patch_name="$(basename "$patchfile")"
+    local patch_name="$(basename "$patchfile")"
+    local abs_patchfile="$(realpath "$patchfile")"
 
     # Check if already applied
     if [[ -f "$prog/$STATUS_FILE" ]] && grep -Fxq "$patch_name" "$prog/$STATUS_FILE"; then
@@ -78,28 +112,56 @@ apply_patch() {
         return 0
     fi
 
-    # Dry run to test
-    if ! (cd "$prog" && patch -p1 --dry-run < "$patchfile" 2>/dev/null); then
-        error "Patch would not apply cleanly. Check for conflicts."
-        return 1
-    fi
+    # Ensure git state is clean
+    ensure_clean_git "$prog" || return 1
 
-    # Actually apply
-    (cd "$prog" && patch -p1 < "$patchfile")
-    echo "$patch_name" >> "$prog/$STATUS_FILE"
-    info "Patch '$patch_name' applied successfully."
+    # Dry run
+    echo "Checking patch $patch_name..."
+    if (cd "$prog" && patch -p1 --dry-run -i "$abs_patchfile"); then
+        # Apply cleanly
+        (cd "$prog" && patch -p1 -i "$abs_patchfile")
+        echo "$patch_name" >> "$prog/$STATUS_FILE"
+        info "Patch '$patch_name' applied successfully."
 
-    # Optionally commit with git
-    if [[ -d "$prog/.git" ]]; then
-        read -p "Commit this change? [y/N] " -n 1 -r
+        # Optionally commit with git
+        if [[ -d "$prog/.git" ]]; then
+            read -p "Commit this change? [y/N] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                (cd "$prog" && git add -A && git commit -m "apply patch: $patch_name")
+            fi
+        fi
+    else
+        error "Patch would not apply cleanly. Dry-run output shown above."
+        read -p "Do you want to attempt to apply the patch anyway? (y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            (cd "$prog" && git add -A && git commit -m "apply patch: $patch_name")
+            # Force apply
+            (cd "$prog" && patch -p1 -i "$abs_patchfile")
+            local ret=$?
+            if [[ $ret -eq 0 ]]; then
+                echo "$patch_name" >> "$prog/$STATUS_FILE"
+                info "Patch '$patch_name' applied (despite previous warnings)."
+                if [[ -d "$prog/.git" ]]; then
+                    read -p "Commit this change? [y/N] " -n 1 -r
+                    echo
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        (cd "$prog" && git add -A && git commit -m "force apply patch: $patch_name")
+                    fi
+                fi
+                warn "If the build fails, use the 'Revert to last commit' option to undo."
+            else
+                error "Patch application failed with exit code $ret. No changes were committed."
+                return 1
+            fi
+        else
+            warn "Skipped applying patch."
+            return 1
         fi
     fi
 }
 
-# Revert the last patch
+# Revert the last patch using .patches_applied tracking
 revert_last_patch() {
     local prog="$1"
     if [[ ! -f "$prog/$STATUS_FILE" ]] || [[ ! -s "$prog/$STATUS_FILE" ]]; then
@@ -108,20 +170,48 @@ revert_last_patch() {
     fi
     local last_patch
     last_patch="$(tail -n 1 "$prog/$STATUS_FILE")"
-    # Find the patch file
     local patchfile="$prog/$PATCHES_DIR/$last_patch"
     if [[ ! -f "$patchfile" ]]; then
         error "Patch file '$last_patch' not found in $PATCHES_DIR. Cannot revert automatically."
         return 1
     fi
-    # Revert using patch -R
-    if (cd "$prog" && patch -p1 -R < "$patchfile"); then
-        # Remove last line from status file
+    local abs_patchfile="$(realpath "$patchfile")"
+    if (cd "$prog" && patch -p1 -R -i "$abs_patchfile"); then
         sed -i '$d' "$prog/$STATUS_FILE"
         info "Reverted patch '$last_patch'."
+        if [[ -d "$prog/.git" ]]; then
+            read -p "Commit the revert? [y/N] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                (cd "$prog" && git add -A && git commit -m "revert patch: $last_patch")
+            fi
+        fi
     else
         error "Failed to revert patch '$last_patch'. Check manually."
         return 1
+    fi
+}
+
+# Revert to last git commit (hard reset)
+revert_to_last_commit() {
+    local prog="$1"
+    if [[ ! -d "$prog/.git" ]]; then
+        error "$prog is not a git repository. Cannot revert using git."
+        return 1
+    fi
+    warn "This will discard all uncommitted changes and reset to the last commit!"
+    read -p "Are you sure? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        (cd "$prog" && git reset --hard HEAD)
+        info "Reverted to last commit."
+        # Also clear the patches applied file if it exists
+        if [[ -f "$prog/$STATUS_FILE" ]]; then
+            rm -f "$prog/$STATUS_FILE"
+            info "Removed patch tracking file."
+        fi
+    else
+        warn "Revert cancelled."
     fi
 }
 
@@ -132,7 +222,6 @@ edit_config() {
         cp "$prog/config.def.h" "$prog/config.h"
     fi
     "$EDITOR" "$prog/config.h"
-    # Optionally commit
     if [[ -d "$prog/.git" ]]; then
         read -p "Commit config change? [y/N] " -n 1 -r
         echo
@@ -186,56 +275,8 @@ global_clean_all() {
 }
 
 # ------------------------------
-# Main menu
+# Program menu (actions for a specific program)
 # ------------------------------
-main_menu() {
-    local programs=()
-    mapfile -t programs < <(get_programs)
-    if [[ ${#programs[@]} -eq 0 ]]; then
-        error "No suckless program directories found (missing config.def.h)."
-        exit 1
-    fi
-
-    PS3="Select a program (or global action): "
-    options=("${programs[@]}" "--- Global Actions ---" "Build all" "Install all" "Clean all" "Quit")
-    while true; do
-        echo
-        echo "===== suckless manager ====="
-        select opt in "${options[@]}"; do
-            case "$opt" in
-                "Build all")
-                    global_build_all
-                    break
-                    ;;
-                "Install all")
-                    global_install_all
-                    break
-                    ;;
-                "Clean all")
-                    global_clean_all
-                    break
-                    ;;
-                "Quit")
-                    exit 0
-                    ;;
-                "--- Global Actions ---")
-                    break
-                    ;;
-                *)
-                    # If a program is selected, go to its submenu
-                    if [[ " ${programs[*]} " =~ " ${opt} " ]]; then
-                        program_menu "$opt"
-                        break
-                    else
-                        warn "Invalid option. Please select a number."
-                        break
-                    fi
-                    ;;
-            esac
-        done
-    done
-}
-
 program_menu() {
     local prog="$1"
     while true; do
@@ -246,25 +287,46 @@ program_menu() {
         echo "3) Build"
         echo "4) Install"
         echo "5) Clean"
-        echo "6) Revert last patch"
-        echo "7) View status"
-        echo "8) Back to main menu"
+        echo "6) Revert last patch (via patch -R)"
+        echo "7) Revert to last git commit (hard reset)"
+        echo "8) View status"
+        echo "9) Back to main menu"
+        echo "0) Exit script"
         read -p "Choose action: " action
         case "$action" in
+            0)
+                info "Exiting."
+                exit 0
+                ;;
             1) # apply patch
                 if [[ ! -d "$prog/$PATCHES_DIR" ]]; then
                     error "No '$PATCHES_DIR' directory found in $prog."
                     continue
                 fi
-                patches=("$prog/$PATCHES_DIR"/*)
-                if [[ ${#patches[@]} -eq 1 && ! -f "${patches[0]}" ]]; then
+                # Collect patch files
+                patch_files=()
+                patch_names=()
+                for f in "$prog/$PATCHES_DIR"/*.diff "$prog/$PATCHES_DIR"/*.patch; do
+                    if [[ -f "$f" ]]; then
+                        patch_files+=("$f")
+                        patch_names+=("$(basename "$f")")
+                    fi
+                done
+                if [[ ${#patch_files[@]} -eq 0 ]]; then
                     error "No patch files in $prog/$PATCHES_DIR."
                     continue
                 fi
                 echo "Available patches:"
-                select patch in "${patches[@]}"; do
-                    if [[ -n "$patch" ]]; then
-                        apply_patch "$prog" "$patch"
+                select name in "${patch_names[@]}" "Cancel"; do
+                    if [[ "$name" == "Cancel" ]]; then
+                        break
+                    elif [[ -n "$name" ]]; then
+                        for i in "${!patch_names[@]}"; do
+                            if [[ "${patch_names[$i]}" == "$name" ]]; then
+                                apply_patch "$prog" "${patch_files[$i]}"
+                                break
+                            fi
+                        done
                         break
                     else
                         warn "Invalid selection."
@@ -276,10 +338,81 @@ program_menu() {
             4) do_install "$prog" ;;
             5) do_clean "$prog" ;;
             6) revert_last_patch "$prog" ;;
-            7) show_status "$prog" ;;
-            8) break ;;
+            7) revert_to_last_commit "$prog" ;;
+            8) show_status "$prog" ;;
+            9) break ;;
             *) warn "Invalid choice." ;;
         esac
+    done
+}
+
+# ------------------------------
+# Global actions menu
+# ------------------------------
+global_menu() {
+    while true; do
+        echo
+        echo "===== Global actions ====="
+        echo "1) Build all programs"
+        echo "2) Install all programs"
+        echo "3) Clean all programs"
+        echo "4) Back to main menu"
+        echo "0) Exit script"
+        read -p "Choose action: " action
+        case "$action" in
+            0)
+                info "Exiting."
+                exit 0
+                ;;
+            1) global_build_all ;;
+            2) global_install_all ;;
+            3) global_clean_all ;;
+            4) break ;;
+            *) warn "Invalid choice." ;;
+        esac
+    done
+}
+
+# ------------------------------
+# Main menu – two‑step selection
+# ------------------------------
+main_menu() {
+    local programs=()
+    mapfile -t programs < <(get_programs)
+    if [[ ${#programs[@]} -eq 0 ]]; then
+        error "No suckless program directories found (missing config.def.h)."
+        exit 1
+    fi
+
+    while true; do
+        echo
+        echo "===== suckless manager ====="
+        PS3="Select a program (0 to exit): "
+        select prog in "${programs[@]}" "Global actions"; do
+            if [[ $REPLY == "0" ]]; then
+                info "Exiting."
+                exit 0
+            fi
+            case "$prog" in
+                "Global actions")
+                    global_menu
+                    break
+                    ;;
+                "")
+                    warn "Invalid selection. Please enter a number."
+                    break
+                    ;;
+                *)
+                    if [[ " ${programs[*]} " =~ " ${prog} " ]]; then
+                        program_menu "$prog"
+                        break
+                    else
+                        warn "Invalid selection. Please enter a number."
+                        break
+                    fi
+                    ;;
+            esac
+        done
     done
 }
 
