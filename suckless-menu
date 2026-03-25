@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+
+# ============================================
+# suckless-menu – manage dwm, st, dmenu, etc.
+# ============================================
+
+set -euo pipefail
+
+# ------------------------------
+# Configuration
+# ------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+EDITOR="${EDITOR:-vim}"                # change to vim, code, etc.
+PATCHES_DIR="patches"                   # name of the subfolder with patch files
+STATUS_FILE=".patches_applied"          # file to record applied patches
+
+# ------------------------------
+# Utility functions
+# ------------------------------
+error() {
+    echo -e "\e[31mError: $1\e[0m" >&2
+}
+
+info() {
+    echo -e "\e[32m$1\e[0m"
+}
+
+warn() {
+    echo -e "\e[33mWarning: $1\e[0m"
+}
+
+# Check if a directory looks like a suckless program
+is_program_dir() {
+    [[ -d "$1" && -f "$1/config.def.h" && ( -f "$1/config.h" || -f "$1/config.mk" ) ]]
+}
+
+# Get list of program directories
+get_programs() {
+    local dirs=()
+    for d in */; do
+        d="${d%/}"
+        if is_program_dir "$d"; then
+            dirs+=("$d")
+        fi
+    done
+    echo "${dirs[@]}"
+}
+
+# Show status of a program
+show_status() {
+    local prog="$1"
+    echo "=== Status for $prog ==="
+    if [[ -f "$prog/$STATUS_FILE" ]]; then
+        echo "Applied patches (in order):"
+        cat "$prog/$STATUS_FILE"
+    else
+        echo "No patches applied."
+    fi
+    if [[ -d "$prog/.git" ]]; then
+        echo -e "\nGit status:"
+        (cd "$prog" && git status -s || true)
+    fi
+    echo "=========================="
+}
+
+# Apply a patch
+apply_patch() {
+    local prog="$1"
+    local patchfile="$2"
+    local patch_name
+    patch_name="$(basename "$patchfile")"
+
+    # Check if already applied
+    if [[ -f "$prog/$STATUS_FILE" ]] && grep -Fxq "$patch_name" "$prog/$STATUS_FILE"; then
+        warn "Patch '$patch_name' already applied. Skipping."
+        return 0
+    fi
+
+    # Dry run to test
+    if ! (cd "$prog" && patch -p1 --dry-run < "$patchfile" 2>/dev/null); then
+        error "Patch would not apply cleanly. Check for conflicts."
+        return 1
+    fi
+
+    # Actually apply
+    (cd "$prog" && patch -p1 < "$patchfile")
+    echo "$patch_name" >> "$prog/$STATUS_FILE"
+    info "Patch '$patch_name' applied successfully."
+
+    # Optionally commit with git
+    if [[ -d "$prog/.git" ]]; then
+        read -p "Commit this change? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            (cd "$prog" && git add -A && git commit -m "apply patch: $patch_name")
+        fi
+    fi
+}
+
+# Revert the last patch
+revert_last_patch() {
+    local prog="$1"
+    if [[ ! -f "$prog/$STATUS_FILE" ]] || [[ ! -s "$prog/$STATUS_FILE" ]]; then
+        warn "No patches to revert."
+        return 1
+    fi
+    local last_patch
+    last_patch="$(tail -n 1 "$prog/$STATUS_FILE")"
+    # Find the patch file
+    local patchfile="$prog/$PATCHES_DIR/$last_patch"
+    if [[ ! -f "$patchfile" ]]; then
+        error "Patch file '$last_patch' not found in $PATCHES_DIR. Cannot revert automatically."
+        return 1
+    fi
+    # Revert using patch -R
+    if (cd "$prog" && patch -p1 -R < "$patchfile"); then
+        # Remove last line from status file
+        sed -i '$d' "$prog/$STATUS_FILE"
+        info "Reverted patch '$last_patch'."
+    else
+        error "Failed to revert patch '$last_patch'. Check manually."
+        return 1
+    fi
+}
+
+# Edit config.h
+edit_config() {
+    local prog="$1"
+    if [[ ! -f "$prog/config.h" ]]; then
+        cp "$prog/config.def.h" "$prog/config.h"
+    fi
+    "$EDITOR" "$prog/config.h"
+    # Optionally commit
+    if [[ -d "$prog/.git" ]]; then
+        read -p "Commit config change? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            (cd "$prog" && git add config.h && git commit -m "edit config.h")
+        fi
+    fi
+}
+
+# Build
+do_build() {
+    local prog="$1"
+    (cd "$prog" && make)
+    info "Build complete for $prog."
+}
+
+# Install (sudo)
+do_install() {
+    local prog="$1"
+    (cd "$prog" && sudo make install)
+    info "Installed $prog."
+}
+
+# Clean
+do_clean() {
+    local prog="$1"
+    (cd "$prog" && make clean)
+    info "Cleaned $prog."
+}
+
+# Global actions
+global_build_all() {
+    for prog in $(get_programs); do
+        info "Building $prog..."
+        (cd "$prog" && make)
+    done
+}
+
+global_install_all() {
+    for prog in $(get_programs); do
+        info "Installing $prog..."
+        (cd "$prog" && sudo make install)
+    done
+}
+
+global_clean_all() {
+    for prog in $(get_programs); do
+        info "Cleaning $prog..."
+        (cd "$prog" && make clean)
+    done
+}
+
+# ------------------------------
+# Main menu
+# ------------------------------
+main_menu() {
+    local programs=()
+    mapfile -t programs < <(get_programs)
+    if [[ ${#programs[@]} -eq 0 ]]; then
+        error "No suckless program directories found (missing config.def.h)."
+        exit 1
+    fi
+
+    PS3="Select a program (or global action): "
+    options=("${programs[@]}" "--- Global Actions ---" "Build all" "Install all" "Clean all" "Quit")
+    while true; do
+        echo
+        echo "===== suckless manager ====="
+        select opt in "${options[@]}"; do
+            case "$opt" in
+                "Build all")
+                    global_build_all
+                    break
+                    ;;
+                "Install all")
+                    global_install_all
+                    break
+                    ;;
+                "Clean all")
+                    global_clean_all
+                    break
+                    ;;
+                "Quit")
+                    exit 0
+                    ;;
+                "--- Global Actions ---")
+                    break
+                    ;;
+                *)
+                    # If a program is selected, go to its submenu
+                    if [[ " ${programs[*]} " =~ " ${opt} " ]]; then
+                        program_menu "$opt"
+                        break
+                    else
+                        warn "Invalid option. Please select a number."
+                        break
+                    fi
+                    ;;
+            esac
+        done
+    done
+}
+
+program_menu() {
+    local prog="$1"
+    while true; do
+        echo
+        echo "===== $prog ====="
+        echo "1) Apply patch"
+        echo "2) Edit config.h"
+        echo "3) Build"
+        echo "4) Install"
+        echo "5) Clean"
+        echo "6) Revert last patch"
+        echo "7) View status"
+        echo "8) Back to main menu"
+        read -p "Choose action: " action
+        case "$action" in
+            1) # apply patch
+                if [[ ! -d "$prog/$PATCHES_DIR" ]]; then
+                    error "No '$PATCHES_DIR' directory found in $prog."
+                    continue
+                fi
+                patches=("$prog/$PATCHES_DIR"/*)
+                if [[ ${#patches[@]} -eq 1 && ! -f "${patches[0]}" ]]; then
+                    error "No patch files in $prog/$PATCHES_DIR."
+                    continue
+                fi
+                echo "Available patches:"
+                select patch in "${patches[@]}"; do
+                    if [[ -n "$patch" ]]; then
+                        apply_patch "$prog" "$patch"
+                        break
+                    else
+                        warn "Invalid selection."
+                    fi
+                done
+                ;;
+            2) edit_config "$prog" ;;
+            3) do_build "$prog" ;;
+            4) do_install "$prog" ;;
+            5) do_clean "$prog" ;;
+            6) revert_last_patch "$prog" ;;
+            7) show_status "$prog" ;;
+            8) break ;;
+            *) warn "Invalid choice." ;;
+        esac
+    done
+}
+
+# ------------------------------
+# Run
+# ------------------------------
+main_menu
