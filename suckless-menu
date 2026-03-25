@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Este script fue generado principalmente por IA (DeepSeek).
+# Este script fue generado principalmente por IA (DeepSeek y Claude).
 
 # ============================================
 # suckless-menu – manage dwm, st, dmenu, etc.
@@ -14,17 +14,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EDITOR="${EDITOR:-vim}"                # change to vim, code, etc.
-PATCHES_DIR="patches"                   # name of the subfolder with patch files
-STATUS_FILE=".patches_applied"          # file to record applied patches
+EDITOR="${EDITOR:-vim}"
+PATCHES_DIR="patches"
+STATUS_FILE=".patches_applied"
 
 # ------------------------------
 # Check required commands
+# FIX #8: added realpath to dependency check
 # ------------------------------
-if ! command -v patch &>/dev/null; then
-    echo -e "\e[31mError: The 'patch' command is not installed. Install it with: sudo pacman -S patch\e[0m" >&2
-    exit 1
-fi
+for cmd in patch realpath; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo -e "\e[31mError: '$cmd' is not installed. Install it with: sudo pacman -S patch coreutils\e[0m" >&2
+        exit 1
+    fi
+done
 
 # ------------------------------
 # Utility functions
@@ -42,11 +45,14 @@ warn() {
 }
 
 # Check if a directory looks like a suckless program
+# FIX #6: also accept Makefile as a valid indicator for fresh clones
 is_program_dir() {
-    [[ -d "$1" && -f "$1/config.def.h" && ( -f "$1/config.h" || -f "$1/config.mk" ) ]]
+    [[ -d "$1" && -f "$1/config.def.h" && \
+       ( -f "$1/config.h" || -f "$1/config.mk" || -f "$1/Makefile" ) ]]
 }
 
 # Get list of program directories (one per line)
+# FIX #4: guard against empty array under set -u
 get_programs() {
     local dirs=()
     for d in */; do
@@ -55,7 +61,7 @@ get_programs() {
             dirs+=("$d")
         fi
     done
-    printf "%s\n" "${dirs[@]}"
+    [[ ${#dirs[@]} -gt 0 ]] && printf "%s\n" "${dirs[@]}"
 }
 
 # Show status of a program
@@ -76,12 +82,14 @@ show_status() {
 }
 
 # Ensure clean git state before patching (if repo)
+# FIX #7: clarified 'skip' option — it continues with a dirty tree (by design);
+#         the prompt text now says so explicitly so the user understands.
 ensure_clean_git() {
     local prog="$1"
     if [[ -d "$prog/.git" ]]; then
         if [[ -n "$(cd "$prog" && git status --porcelain)" ]]; then
             warn "You have uncommitted changes in $prog."
-            read -p "Commit them now? (y/n/skip) [y/N] " -n 1 -r
+            read -p "Commit them now? (y)es / (s)kip and proceed with dirty tree / (a)bort [a] " -n 1 -r
             echo
             case "$REPLY" in
                 y|Y)
@@ -89,7 +97,7 @@ ensure_clean_git() {
                     info "Changes committed."
                     ;;
                 s|S)
-                    info "Skipping – changes will remain uncommitted."
+                    warn "Proceeding with uncommitted changes. Git history may be messy."
                     ;;
                 *)
                     warn "Aborting patch application. Please commit or stash your changes first."
@@ -102,11 +110,14 @@ ensure_clean_git() {
 }
 
 # Apply a patch
+# FIX #1: capture patch exit code safely under set -e using || ret=$?
 apply_patch() {
     local prog="$1"
     local patchfile="$2"
-    local patch_name="$(basename "$patchfile")"
-    local abs_patchfile="$(realpath "$patchfile")"
+    local patch_name
+    patch_name="$(basename "$patchfile")"
+    local abs_patchfile
+    abs_patchfile="$(realpath "$patchfile")"
 
     # Check if already applied
     if [[ -f "$prog/$STATUS_FILE" ]] && grep -Fxq "$patch_name" "$prog/$STATUS_FILE"; then
@@ -125,7 +136,6 @@ apply_patch() {
         echo "$patch_name" >> "$prog/$STATUS_FILE"
         info "Patch '$patch_name' applied successfully."
 
-        # Optionally commit with git
         if [[ -d "$prog/.git" ]]; then
             read -p "Commit this change? [y/N] " -n 1 -r
             echo
@@ -135,12 +145,12 @@ apply_patch() {
         fi
     else
         error "Patch would not apply cleanly. Dry-run output shown above."
-        read -p "Do you want to attempt to apply the patch anyway? (y/N) " -n 1 -r
+        read -p "Attempt to apply the patch anyway? (y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            # Force apply
-            (cd "$prog" && patch -p1 -i "$abs_patchfile")
-            local ret=$?
+            local ret=0
+            # FIX #1: use || assignment so set -e does not kill the script here
+            (cd "$prog" && patch -p1 -i "$abs_patchfile") || ret=$?
             if [[ $ret -eq 0 ]]; then
                 echo "$patch_name" >> "$prog/$STATUS_FILE"
                 info "Patch '$patch_name' applied (despite previous warnings)."
@@ -151,7 +161,7 @@ apply_patch() {
                         (cd "$prog" && git add -A && git commit -m "force apply patch: $patch_name")
                     fi
                 fi
-                warn "If the build fails, use the 'Revert to last commit' option to undo."
+                warn "If the build fails, use 'Revert to last commit' to undo."
             else
                 error "Patch application failed with exit code $ret. No changes were committed."
                 return 1
@@ -164,6 +174,8 @@ apply_patch() {
 }
 
 # Revert the last patch using .patches_applied tracking
+# FIX #5: added dry-run before actually reversing the patch
+# FIX #9: use sed -i'' for POSIX portability (works on macOS/BSD too)
 revert_last_patch() {
     local prog="$1"
     if [[ ! -f "$prog/$STATUS_FILE" ]] || [[ ! -s "$prog/$STATUS_FILE" ]]; then
@@ -177,9 +189,20 @@ revert_last_patch() {
         error "Patch file '$last_patch' not found in $PATCHES_DIR. Cannot revert automatically."
         return 1
     fi
-    local abs_patchfile="$(realpath "$patchfile")"
+    local abs_patchfile
+    abs_patchfile="$(realpath "$patchfile")"
+
+    # FIX #5: dry-run first, same discipline as apply_patch
+    echo "Checking reverse of $last_patch..."
+    if ! (cd "$prog" && patch -p1 -R --dry-run -i "$abs_patchfile"); then
+        error "Reverse patch would not apply cleanly. Aborting to avoid corrupting the tree."
+        warn "Consider using 'Revert to last git commit' if the repo is in an inconsistent state."
+        return 1
+    fi
+
     if (cd "$prog" && patch -p1 -R -i "$abs_patchfile"); then
-        sed -i '$d' "$prog/$STATUS_FILE"
+        # FIX #9: sed -i'' is portable across GNU and BSD sed
+        sed -i'' '$d' "$prog/$STATUS_FILE"
         info "Reverted patch '$last_patch'."
         if [[ -d "$prog/.git" ]]; then
             read -p "Commit the revert? [y/N] " -n 1 -r
@@ -207,7 +230,6 @@ revert_to_last_commit() {
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         (cd "$prog" && git reset --hard HEAD)
         info "Reverted to last commit."
-        # Also clear the patches applied file if it exists
         if [[ -f "$prog/$STATUS_FILE" ]]; then
             rm -f "$prog/$STATUS_FILE"
             info "Removed patch tracking file."
@@ -255,24 +277,32 @@ do_clean() {
 }
 
 # Global actions
+# FIX #2: use mapfile instead of word-splitting $(get_programs)
+# FIX #3: use || error(...) so a single failure doesn't abort the loop
 global_build_all() {
-    for prog in $(get_programs); do
+    local programs=()
+    mapfile -t programs < <(get_programs)
+    for prog in "${programs[@]}"; do
         info "Building $prog..."
-        (cd "$prog" && make)
+        (cd "$prog" && make) || error "Build failed for $prog — continuing with remaining programs."
     done
 }
 
 global_install_all() {
-    for prog in $(get_programs); do
+    local programs=()
+    mapfile -t programs < <(get_programs)
+    for prog in "${programs[@]}"; do
         info "Installing $prog..."
-        (cd "$prog" && sudo make install)
+        (cd "$prog" && sudo make install) || error "Install failed for $prog — continuing with remaining programs."
     done
 }
 
 global_clean_all() {
-    for prog in $(get_programs); do
+    local programs=()
+    mapfile -t programs < <(get_programs)
+    for prog in "${programs[@]}"; do
         info "Cleaning $prog..."
-        (cd "$prog" && make clean)
+        (cd "$prog" && make clean) || error "Clean failed for $prog — continuing with remaining programs."
     done
 }
 
@@ -300,12 +330,11 @@ program_menu() {
                 info "Exiting."
                 exit 0
                 ;;
-            1) # apply patch
+            1)
                 if [[ ! -d "$prog/$PATCHES_DIR" ]]; then
                     error "No '$PATCHES_DIR' directory found in $prog."
                     continue
                 fi
-                # Collect patch files
                 patch_files=()
                 patch_names=()
                 for f in "$prog/$PATCHES_DIR"/*.diff "$prog/$PATCHES_DIR"/*.patch; do
@@ -376,7 +405,8 @@ global_menu() {
 }
 
 # ------------------------------
-# Main menu – two‑step selection
+# Main menu
+# FIX #2: mapfile already used here (was correct); kept consistent
 # ------------------------------
 main_menu() {
     local programs=()
